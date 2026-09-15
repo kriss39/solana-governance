@@ -36,6 +36,7 @@
   - `NCN_PROGRAM_ID` (required): NCN program ID on Solana
   - `NCN_WHITELIST_MAINNET_PATH` / `NCN_WHITELIST_TESTNET_PATH` (optional): Output paths for whitelist JSON (defaults to `ncn_whitelist.mainnet.json` / `ncn_whitelist.testnet.json`)
   - `NCN_MAX_VERIFIER_SLOT_LAG` (optional): How many slots a verifier's snapshot may trail the freshest whitelisted verifier before it is marked `stale` and dropped from routing (default: `432000`, one epoch / ~2 days). A verifier that stopped uploading still matches the on-chain ballot for its own old slot, so it stays `ok` without this bound and 404s every current proof request.
+- **Statuses** written to the whitelist file: `ok` (routable), `mismatch` (root or hash disagrees with the on-chain ballot), `stale` (see above), `error` (verifier or RPC unreachable) and `pending`. A verifier is `pending` when its newest snapshot is for a ballot box that has not reached consensus yet — operators upload before they vote, so this is normal for a few hours — and it could not be judged on the newest finalized snapshot instead: it no longer serves that slot, or it runs a verifier service older than 0.6 that ignores `/meta?slot=`. Verifiers that still serve the finalized snapshot stay `ok` (with a reason noting the pending upload) so routing keeps working for proposals voting against it.
 
 ### Usage
 

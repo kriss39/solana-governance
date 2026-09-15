@@ -49,7 +49,7 @@ struct MetaResponse {
     created_at: Option<String>,
 }
 
-#[derive(Debug, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 struct LogEntry {
     timestamp: String,
     name: String,
@@ -252,8 +252,35 @@ fn compare_with_chain(
     });
     let program_id = Pubkey::from_str(&program_id_str)?;
     let client = RpcClient::new(rpc_url);
+    let http = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
 
     println!("network | name | meta_merkle_root | snapshot_hash | (domain)");
+
+    // Pass 1: read the ballot box for every distinct slot the fleet reports.
+    // A slot whose box has not reached consensus is "pending": the operators
+    // uploaded their snapshots (the documented order is upload, then vote) but
+    // the chain has no canonical root yet, so such an entry can neither match
+    // nor mismatch. Judging it against the zero `winning_ballot` would demote
+    // every up-to-date verifier at once and leave nothing to route to.
+    let mut states: std::collections::HashMap<u64, Result<BallotBoxState, String>> =
+        std::collections::HashMap::new();
+    for entry in entries.iter().filter(|e| e.error.is_none()) {
+        states
+            .entry(entry.slot)
+            .or_insert_with(|| fetch_ballot_box_state_cron(&client, &program_id, entry.slot));
+    }
+
+    // The newest slot with a finalized ballot. Verifiers that already moved on
+    // to a pending slot are judged by what they still serve for this one.
+    let reference_slot = states
+        .iter()
+        .filter_map(|(slot, state)| match state {
+            Ok(s) if s.slot_consensus_reached != 0 => Some(*slot),
+            _ => None,
+        })
+        .max();
 
     let mut whitelist_verifiers: Vec<WhitelistVerifier> = Vec::new();
     let mut chosen_slot: u64 = 0;
@@ -274,67 +301,51 @@ fn compare_with_chain(
             continue;
         }
 
-        match fetch_winning_ballot_cron(&client, &program_id, entry.slot) {
-            Ok(ballot) => {
-                let onchain_merkle_root = bytes32_base58(&ballot.meta_merkle_root);
-                let onchain_snapshot_hash = bytes32_base58(&ballot.snapshot_hash);
-
-                let merkle_match = onchain_merkle_root == entry.merkle_root;
-                let snapshot_match = onchain_snapshot_hash == entry.snapshot_hash;
-
-                println!(
-                    "{} | {} | meta_merkle_root ({}) | snapshot_hash ({}) | ({})",
-                    network,
-                    entry.name,
-                    if merkle_match { "matched" } else { "mismatch" },
-                    if snapshot_match { "matched" } else { "mismatch" },
-                    entry.domain
-                );
-
-                let status = if merkle_match && snapshot_match {
-                    "ok".to_string()
-                } else {
-                    "mismatch".to_string()
-                };
-                let reason = if status == "ok" {
-                    None
-                } else {
-                    Some(format!(
-                        "merkle_match={}, snapshot_match={}",
-                        merkle_match, snapshot_match
-                    ))
-                };
-
-                if status == "ok" && entry.slot > chosen_slot {
-                    chosen_slot = entry.slot;
-                }
-
-                whitelist_verifiers.push(WhitelistVerifier {
-                    name: entry.name.clone(),
-                    domain: entry.domain.clone(),
-                    slot: entry.slot,
-                    status,
-                    reason,
-                });
+        let verifier = match states.get(&entry.slot) {
+            Some(Ok(state)) if state.slot_consensus_reached != 0 => {
+                classify_entry_against_ballot(entry, &state.winning_ballot)
             }
-            Err(e) => {
-                println!(
-                    "{} | {} | meta_merkle_root (fetch_failed) | snapshot_hash (fetch_failed) | ({})",
-                    network, entry.name, entry.domain
-                );
+            Some(Ok(_pending)) => judge_pending_entry(
+                |url| fetch_meta_response(&http, url),
+                entry,
+                network,
+                reference_slot,
+                &states,
+            ),
+            Some(Err(e)) => {
                 eprintln!(
                     "[ncn-meta-cron] fetch failed for {} (slot {}): {}",
                     entry.name, entry.slot, e
                 );
-                whitelist_verifiers.push(WhitelistVerifier {
+                WhitelistVerifier {
                     name: entry.name.clone(),
                     domain: entry.domain.clone(),
                     slot: entry.slot,
                     status: "error".to_string(),
-                    reason: Some(e),
-                });
+                    reason: Some(e.clone()),
+                }
             }
+            None => unreachable!("every non-error entry has a fetched state"),
+        };
+
+        println!(
+            "{} | {} | slot {} | {}{} | ({})",
+            network,
+            entry.name,
+            verifier.slot,
+            verifier.status,
+            verifier
+                .reason
+                .as_deref()
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default(),
+            entry.domain
+        );
+
+        if verifier.status == "ok" && verifier.slot > chosen_slot {
+            chosen_slot = verifier.slot;
         }
+        whitelist_verifiers.push(verifier);
     }
 
     // Build and write whitelist snapshot for this network.
@@ -505,11 +516,11 @@ fn dedupe_verifiers_by_domain(verifiers: Vec<WhitelistVerifier>) -> Vec<Whitelis
     deduped
 }
 
-fn fetch_winning_ballot_cron(
+fn fetch_ballot_box_state_cron(
     client: &RpcClient,
     program_id: &Pubkey,
     snapshot_slot: u64,
-) -> Result<Ballot, String> {
+) -> Result<BallotBoxState, String> {
     let seeds: &[&[u8]] = &[b"BallotBox", &snapshot_slot.to_le_bytes()];
     let (ballot_box_pda, _bump) = Pubkey::find_program_address(seeds, program_id);
 
@@ -525,7 +536,7 @@ fn fetch_winning_ballot_cron(
                         .to_string(),
                 );
             }
-            parse_winning_ballot(rest)
+            parse_ballot_box_state(rest)
         }
         Err(e) => Err(format!(
             "Failed to fetch BallotBox account: {}",
@@ -534,7 +545,97 @@ fn fetch_winning_ballot_cron(
     }
 }
 
-fn parse_winning_ballot(mut data: &[u8]) -> Result<Ballot, String> {
+/// Status for a verifier whose newest snapshot (`entry.slot`) has no on-chain
+/// consensus yet.
+///
+/// The verifier is asked for `reference_slot` — the newest slot that *does*
+/// have consensus — and judged on that. A verifier still serving the canonical
+/// snapshot stays routable while the fleet votes on the next one; one that
+/// has already pruned it, or that ignores the `slot` parameter (verifier
+/// service < 0.6 answers `/meta?slot=` with its newest snapshot), is reported
+/// as `pending` rather than `ok`. With no reference slot at all — the very
+/// first snapshot — there is nothing to judge against, so the entry is
+/// `pending` too.
+fn judge_pending_entry(
+    fetch_meta_at: impl Fn(&str) -> Result<MetaResponse, String>,
+    entry: &LogEntry,
+    network: &str,
+    reference_slot: Option<u64>,
+    states: &std::collections::HashMap<u64, Result<BallotBoxState, String>>,
+) -> WhitelistVerifier {
+    let pending = |reason: String| WhitelistVerifier {
+        name: entry.name.clone(),
+        domain: entry.domain.clone(),
+        slot: entry.slot,
+        status: "pending".to_string(),
+        reason: Some(reason),
+    };
+
+    let Some(reference_slot) = reference_slot else {
+        return pending(format!(
+            "slot {} has no consensus yet and no earlier finalized snapshot exists",
+            entry.slot
+        ));
+    };
+    let Some(Ok(reference)) = states.get(&reference_slot) else {
+        return pending(format!(
+            "slot {} has no consensus yet and the reference ballot box could not be read",
+            entry.slot
+        ));
+    };
+
+    let url = format!(
+        "{}meta?network={}&slot={}",
+        normalize_base_url(&entry.domain),
+        network,
+        reference_slot
+    );
+    let meta = match fetch_meta_at(&url) {
+        Ok(meta) => meta,
+        Err(e) => {
+            return pending(format!(
+                "slot {} has no consensus yet; /meta?slot={} {}",
+                entry.slot, reference_slot, e
+            ))
+        }
+    };
+    if meta.slot != reference_slot {
+        return pending(format!(
+            "slot {} has no consensus yet; verifier answered /meta?slot={} with slot {}",
+            entry.slot, reference_slot, meta.slot
+        ));
+    }
+
+    let reference_entry = LogEntry {
+        slot: reference_slot,
+        merkle_root: meta.merkle_root,
+        snapshot_hash: meta.snapshot_hash,
+        ..entry.clone()
+    };
+    let mut verifier = classify_entry_against_ballot(&reference_entry, &reference.winning_ballot);
+    if verifier.status == "ok" {
+        verifier.reason = Some(format!(
+            "newest snapshot {} awaits consensus; judged on finalized slot {}",
+            entry.slot, reference_slot
+        ));
+    }
+    verifier
+}
+
+#[cfg(test)]
+fn parse_winning_ballot(data: &[u8]) -> Result<Ballot, String> {
+    parse_ballot_box_state(data).map(|state| state.winning_ballot)
+}
+
+/// The two BallotBox fields the cron needs: whether operators have reached
+/// consensus for the slot, and the ballot that won if they have.
+#[derive(Debug)]
+struct BallotBoxState {
+    slot_consensus_reached: u64,
+    winning_ballot: Ballot,
+}
+
+fn parse_ballot_box_state(mut data: &[u8]) -> Result<BallotBoxState, String> {
     // BallotBox layout (after 8-byte discriminator), as per IDL:
     // bump: u8
     // epoch: u64
@@ -545,10 +646,44 @@ fn parse_winning_ballot(mut data: &[u8]) -> Result<Ballot, String> {
     read_u8(&mut data)?;
     read_u64(&mut data)?;
     read_u64(&mut data)?;
-    read_u64(&mut data)?;
+    let slot_consensus_reached = read_u64(&mut data)?;
     read_u16(&mut data)?;
 
-    Ballot::deserialize(&mut data).map_err(|e| e.to_string())
+    let winning_ballot = Ballot::deserialize(&mut data).map_err(|e| e.to_string())?;
+    Ok(BallotBoxState {
+        slot_consensus_reached,
+        winning_ballot,
+    })
+}
+
+/// Status the cron assigns to a verifier whose newest snapshot is `entry`,
+/// given the on-chain ballot box for `entry.slot`. Mirrors the inline logic in
+/// `compare_with_chain`.
+fn classify_entry_against_ballot(entry: &LogEntry, ballot: &Ballot) -> WhitelistVerifier {
+    let onchain_merkle_root = bytes32_base58(&ballot.meta_merkle_root);
+    let onchain_snapshot_hash = bytes32_base58(&ballot.snapshot_hash);
+    let merkle_match = onchain_merkle_root == entry.merkle_root;
+    let snapshot_match = onchain_snapshot_hash == entry.snapshot_hash;
+    let status = if merkle_match && snapshot_match {
+        "ok".to_string()
+    } else {
+        "mismatch".to_string()
+    };
+    let reason = if status == "ok" {
+        None
+    } else {
+        Some(format!(
+            "merkle_match={}, snapshot_match={}",
+            merkle_match, snapshot_match
+        ))
+    };
+    WhitelistVerifier {
+        name: entry.name.clone(),
+        domain: entry.domain.clone(),
+        slot: entry.slot,
+        status,
+        reason,
+    }
 }
 
 fn take<const N: usize>(data: &mut &[u8]) -> Result<[u8; N], String> {
@@ -628,6 +763,16 @@ fn log_entry_from_meta(
         created_at: meta.created_at,
         error: None,
     }
+}
+
+/// GET `url` and decode the verifier's `/meta` body.
+fn fetch_meta_response(client: &Client, url: &str) -> Result<MetaResponse, String> {
+    let resp = client.get(url).send().map_err(|e| format!("failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("returned HTTP {}", resp.status()));
+    }
+    resp.json::<MetaResponse>()
+        .map_err(|e| format!("unparsable: {e}"))
 }
 
 fn fetch_meta(
@@ -928,5 +1073,223 @@ mod tests {
                 .count(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod pending_consensus {
+    //! A verifier whose newest snapshot awaits consensus must be judged by the
+    //! newest finalized snapshot it still serves, not by the zero
+    //! `winning_ballot` of the pending ballot box. `init_ballot_box` leaves
+    //! `winning_ballot` all-zero until `cast_vote` crosses the threshold, and
+    //! operators upload before they vote, so the naive comparison demotes the
+    //! whole fleet together and `select_routable_verifiers` in `router.rs` is
+    //! left with nothing while an older proposal is still being voted on.
+    use super::*;
+    use std::collections::HashMap;
+
+    const S1: u64 = 440_641_000; // finalized on mainnet
+    const S2: u64 = 441_073_000; // pending
+    const S1_ROOT: &str = "2Jwjfi6KWQmqMraTkCcWqdj3VvyGcVgfNGYdzTQmaUj8";
+    const S1_HASH: &str = "7TgfsjkYnyJ6DWKG8CTc7Yt9426fKRqs5Fh2xvunvXZ2";
+    const S2_ROOT: &str = "3MpDoa4y8sNvuLd2ba9YJGzDeUnmA8b7fdrWYqW7QKf6";
+    const S2_HASH: &str = "4fN6P4hwZXMAsn1KpTbHEk2rDdsyG8XzM9Dq8uwHzrEP";
+
+    fn bs58_decode32(s: &str) -> [u8; 32] {
+        let bytes = solana_sdk::bs58::decode(s).into_vec().unwrap();
+        bytes.as_slice().try_into().unwrap()
+    }
+
+    /// Bytes of a `BallotBox` exactly as `init_ballot_box` leaves them: the
+    /// handler writes bump/epoch/slot_created/threshold/expiry/snapshot_slot
+    /// and nothing else, so `winning_ballot` is `Ballot::default()`.
+    fn freshly_initialized_ballot_box(snapshot_slot: u64) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&BALLOT_BOX_DISCRIMINATOR);
+        data.push(255);
+        data.extend_from_slice(&1012u64.to_le_bytes());
+        data.extend_from_slice(&437_227_093u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes()); // slot_consensus_reached
+        data.extend_from_slice(&6000u16.to_le_bytes());
+        data.extend_from_slice(&[0u8; 64]); // winning_ballot
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0i64.to_le_bytes());
+        data.extend_from_slice(&snapshot_slot.to_le_bytes());
+        data
+    }
+
+    fn entry(name: &str, slot: u64, root: &str, hash: &str) -> LogEntry {
+        LogEntry {
+            timestamp: String::new(),
+            name: name.to_string(),
+            domain: format!("https://{name}.example"),
+            network: "mainnet".to_string(),
+            slot,
+            merkle_root: root.to_string(),
+            snapshot_hash: hash.to_string(),
+            created_at: None,
+            error: None,
+        }
+    }
+
+    fn states() -> HashMap<u64, Result<BallotBoxState, String>> {
+        let pending = parse_ballot_box_state(&freshly_initialized_ballot_box(S2)[8..]).unwrap();
+        let finalized = BallotBoxState {
+            slot_consensus_reached: 440_679_236,
+            winning_ballot: Ballot {
+                meta_merkle_root: bs58_decode32(S1_ROOT),
+                snapshot_hash: bs58_decode32(S1_HASH),
+            },
+        };
+        HashMap::from([(S1, Ok(finalized)), (S2, Ok(pending))])
+    }
+
+    fn meta(slot: u64, root: &str, hash: &str) -> MetaResponse {
+        MetaResponse {
+            network: "mainnet".to_string(),
+            slot,
+            merkle_root: root.to_string(),
+            snapshot_hash: hash.to_string(),
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn a_fresh_ballot_box_parses_to_a_zero_winning_ballot() {
+        let state = parse_ballot_box_state(&freshly_initialized_ballot_box(S2)[8..]).unwrap();
+        assert_eq!(state.slot_consensus_reached, 0);
+        assert_eq!(state.winning_ballot.meta_merkle_root, [0u8; 32]);
+        assert_eq!(state.winning_ballot.snapshot_hash, [0u8; 32]);
+    }
+
+    #[test]
+    fn the_naive_comparison_demotes_every_up_to_date_verifier() {
+        // The pre-fix behaviour, kept as documentation of why the fallback exists.
+        let winning = parse_winning_ballot(&freshly_initialized_ballot_box(S2)[8..]).unwrap();
+        let verifiers: Vec<WhitelistVerifier> = ["a", "b", "c", "d"]
+            .map(|n| entry(n, S2, S2_ROOT, S2_HASH))
+            .iter()
+            .map(|e| classify_entry_against_ballot(e, &winning))
+            .collect();
+        assert!(verifiers.iter().all(|v| v.status == "mismatch"));
+        assert!(verifiers.iter().filter(|v| v.status == "ok").next().is_none());
+    }
+
+    #[test]
+    fn a_verifier_still_serving_the_finalized_snapshot_stays_routable() {
+        let e = entry("a", S2, S2_ROOT, S2_HASH);
+        let fetched = std::cell::RefCell::new(Vec::new());
+        let v = judge_pending_entry(
+            |url| {
+                fetched.borrow_mut().push(url.to_string());
+                Ok(meta(S1, S1_ROOT, S1_HASH))
+            },
+            &e,
+            "mainnet",
+            Some(S1),
+            &states(),
+        );
+        assert_eq!(v.status, "ok", "{v:?}");
+        // Judged (and later staleness-checked) at the reference slot.
+        assert_eq!(v.slot, S1);
+        assert!(v.reason.unwrap().contains("awaits consensus"));
+        assert_eq!(
+            fetched.borrow().as_slice(),
+            [format!("https://a.example/meta?network=mainnet&slot={S1}")]
+        );
+    }
+
+    #[test]
+    fn a_verifier_whose_finalized_snapshot_disagrees_with_chain_is_a_mismatch() {
+        let e = entry("a", S2, S2_ROOT, S2_HASH);
+        let v = judge_pending_entry(
+            |_| Ok(meta(S1, S2_ROOT, S1_HASH)),
+            &e,
+            "mainnet",
+            Some(S1),
+            &states(),
+        );
+        assert_eq!(v.status, "mismatch");
+    }
+
+    #[test]
+    fn a_verifier_that_ignores_the_slot_parameter_is_pending_not_ok() {
+        // verifier-service < 0.6 answers /meta?slot= with its newest snapshot.
+        let e = entry("a", S2, S2_ROOT, S2_HASH);
+        let v = judge_pending_entry(
+            |_| Ok(meta(S2, S2_ROOT, S2_HASH)),
+            &e,
+            "mainnet",
+            Some(S1),
+            &states(),
+        );
+        assert_eq!(v.status, "pending", "{v:?}");
+        assert!(v.reason.unwrap().contains("answered /meta?slot="));
+    }
+
+    #[test]
+    fn a_verifier_that_pruned_the_finalized_snapshot_is_pending() {
+        let e = entry("a", S2, S2_ROOT, S2_HASH);
+        let v = judge_pending_entry(
+            |_| Err("returned HTTP 404 Not Found".to_string()),
+            &e,
+            "mainnet",
+            Some(S1),
+            &states(),
+        );
+        assert_eq!(v.status, "pending");
+        assert!(v.reason.unwrap().contains("HTTP 404"));
+    }
+
+    #[test]
+    fn the_very_first_snapshot_has_nothing_to_fall_back_to() {
+        let e = entry("a", S2, S2_ROOT, S2_HASH);
+        let mut only_pending = states();
+        only_pending.remove(&S1);
+        let v = judge_pending_entry(
+            |_| panic!("no reference slot, nothing to fetch"),
+            &e,
+            "mainnet",
+            None,
+            &only_pending,
+        );
+        assert_eq!(v.status, "pending");
+    }
+
+    #[test]
+    fn pending_entries_do_not_survive_as_routable_or_move_the_chosen_slot() {
+        // Mirrors the tail of compare_with_chain: pending is neither `ok` nor
+        // does it raise chosen_slot, so demote_stale_verifiers measures the
+        // fleet against the finalized slot.
+        let ok_on_reference = judge_pending_entry(
+            |_| Ok(meta(S1, S1_ROOT, S1_HASH)),
+            &entry("a", S2, S2_ROOT, S2_HASH),
+            "mainnet",
+            Some(S1),
+            &states(),
+        );
+        let pruned = judge_pending_entry(
+            |_| Err("returned HTTP 404 Not Found".to_string()),
+            &entry("b", S2, S2_ROOT, S2_HASH),
+            "mainnet",
+            Some(S1),
+            &states(),
+        );
+        let mut verifiers = vec![ok_on_reference, pruned];
+        let chosen_slot = verifiers
+            .iter()
+            .filter(|v| v.status == "ok")
+            .map(|v| v.slot)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(chosen_slot, S1);
+        demote_stale_verifiers(&mut verifiers, chosen_slot, DEFAULT_MAX_VERIFIER_SLOT_LAG);
+        let routable: Vec<&str> = verifiers
+            .iter()
+            .filter(|v| v.status == "ok")
+            .map(|v| v.name.as_str())
+            .collect();
+        assert_eq!(routable, ["a"]);
     }
 }
