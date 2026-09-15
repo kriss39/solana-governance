@@ -62,7 +62,7 @@ struct LogEntry {
     error: Option<String>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 struct WhitelistVerifier {
     name: String,
     domain: String,
@@ -74,7 +74,7 @@ struct WhitelistVerifier {
     reason: Option<String>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 struct WhitelistSnapshot {
     network: String,
     slot: u64,
@@ -258,18 +258,22 @@ fn compare_with_chain(
 
     println!("network | name | meta_merkle_root | snapshot_hash | (domain)");
 
-    // Pass 1: read the ballot box for every distinct slot the fleet reports.
-    // A slot whose box has not reached consensus is "pending": the operators
-    // uploaded their snapshots (the documented order is upload, then vote) but
-    // the chain has no canonical root yet, so such an entry can neither match
-    // nor mismatch. Judging it against the zero `winning_ballot` would demote
-    // every up-to-date verifier at once and leave nothing to route to.
+    // Pass 1: read the ballot box for every distinct slot the fleet reports,
+    // plus the slot the previous run whitelisted. A slot whose box has not
+    // reached consensus is "pending": the operators uploaded their snapshots
+    // (the documented order is upload, then vote) but the chain has no
+    // canonical root yet, so such an entry can neither match nor mismatch.
+    // Judging it against the zero `winning_ballot` would demote every
+    // up-to-date verifier at once and leave nothing to route to. The previous
+    // whitelist slot keeps a finalized reference available even once the whole
+    // fleet reports the pending slot and nobody names the finalized one.
+    let whitelist_path = whitelist_path_for(network);
     let mut states: std::collections::HashMap<u64, Result<BallotBoxState, String>> =
         std::collections::HashMap::new();
-    for entry in entries.iter().filter(|e| e.error.is_none()) {
+    for slot in candidate_slots(&entries, previous_whitelist_slot(&whitelist_path)) {
         states
-            .entry(entry.slot)
-            .or_insert_with(|| fetch_ballot_box_state_cron(&client, &program_id, entry.slot));
+            .entry(slot)
+            .or_insert_with(|| fetch_ballot_box_state_cron(&client, &program_id, slot));
     }
 
     // The newest slot with a finalized ballot. Verifiers that already moved on
@@ -381,13 +385,6 @@ fn compare_with_chain(
         verifiers: whitelist_verifiers,
     };
 
-    let whitelist_path = match network {
-        "testnet" => env::var("NCN_WHITELIST_TESTNET_PATH")
-            .unwrap_or_else(|_| "ncn_whitelist.testnet.json".to_string()),
-        _ => env::var("NCN_WHITELIST_MAINNET_PATH")
-            .unwrap_or_else(|_| "ncn_whitelist.mainnet.json".to_string()),
-    };
-
     if let Err(e) =
         std::fs::write(&whitelist_path, serde_json::to_string_pretty(&whitelist)?)
     {
@@ -403,6 +400,39 @@ fn compare_with_chain(
     }
 
     Ok(())
+}
+
+fn whitelist_path_for(network: &str) -> String {
+    match network {
+        "testnet" => env::var("NCN_WHITELIST_TESTNET_PATH")
+            .unwrap_or_else(|_| "ncn_whitelist.testnet.json".to_string()),
+        _ => env::var("NCN_WHITELIST_MAINNET_PATH")
+            .unwrap_or_else(|_| "ncn_whitelist.mainnet.json".to_string()),
+    }
+}
+
+/// The slot the previous run wrote to the whitelist file, if any. It is the
+/// last slot at which some verifier was `ok`, so it is a finalized slot the
+/// fleet served recently — the reference to fall back on once every verifier
+/// has moved its newest snapshot to a pending slot.
+fn previous_whitelist_slot(whitelist_path: &str) -> Option<u64> {
+    let contents = fs::read_to_string(whitelist_path).ok()?;
+    let previous: WhitelistSnapshot = serde_json::from_str(&contents).ok()?;
+    (previous.slot != 0).then_some(previous.slot)
+}
+
+/// Distinct slots whose ballot boxes pass 1 reads: every slot a verifier
+/// reported plus the previous whitelist slot.
+fn candidate_slots(entries: &[LogEntry], previous_slot: Option<u64>) -> Vec<u64> {
+    let mut slots: Vec<u64> = entries
+        .iter()
+        .filter(|e| e.error.is_none())
+        .map(|e| e.slot)
+        .chain(previous_slot)
+        .collect();
+    slots.sort_unstable();
+    slots.dedup();
+    slots
 }
 
 fn max_verifier_slot_lag() -> u64 {
@@ -1255,6 +1285,79 @@ mod pending_consensus {
             &only_pending,
         );
         assert_eq!(v.status, "pending");
+    }
+
+    #[test]
+    fn the_previous_whitelist_slot_keeps_a_reference_once_the_whole_fleet_is_pending() {
+        // Every verifier has uploaded S2 and none reports S1 any more. The
+        // fleet's own answers offer no finalized slot; the slot the previous
+        // run whitelisted does.
+        let entries: Vec<LogEntry> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| entry(n, S2, S2_ROOT, S2_HASH))
+            .collect();
+        assert_eq!(candidate_slots(&entries, None), vec![S2]);
+        assert_eq!(candidate_slots(&entries, Some(S1)), vec![S1, S2]);
+
+        let reference_slot = states()
+            .iter()
+            .filter_map(|(slot, state)| match state {
+                Ok(s) if s.slot_consensus_reached != 0 => Some(*slot),
+                _ => None,
+            })
+            .max();
+        assert_eq!(reference_slot, Some(S1));
+
+        let verifiers: Vec<WhitelistVerifier> = entries
+            .iter()
+            .map(|e| {
+                judge_pending_entry(
+                    |_| Ok(meta(S1, S1_ROOT, S1_HASH)),
+                    e,
+                    "mainnet",
+                    reference_slot,
+                    &states(),
+                )
+            })
+            .collect();
+        assert!(verifiers.iter().all(|v| v.status == "ok"), "{verifiers:?}");
+    }
+
+    #[test]
+    fn the_previous_whitelist_slot_is_read_from_the_file_the_cron_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "ncn-router-whitelist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ncn_whitelist.mainnet.json");
+        let path = path.to_str().unwrap();
+
+        assert_eq!(previous_whitelist_slot(path), None, "no file yet");
+
+        let written = WhitelistSnapshot {
+            network: "mainnet".to_string(),
+            slot: S1,
+            updated_at: "2026-09-16T00:00:00Z".to_string(),
+            verifiers: vec![entry("a", S1, S1_ROOT, S1_HASH)]
+                .iter()
+                .map(|e| classify_entry_against_ballot(e, &states()[&S1].as_ref().unwrap().winning_ballot))
+                .collect(),
+        };
+        fs::write(path, serde_json::to_string_pretty(&written).unwrap()).unwrap();
+        assert_eq!(previous_whitelist_slot(path), Some(S1));
+
+        // A run that found no ok verifier writes slot 0; that is not a reference.
+        fs::write(path, r#"{"network":"mainnet","slot":0,"updated_at":"","verifiers":[]}"#).unwrap();
+        assert_eq!(previous_whitelist_slot(path), None);
+
+        fs::write(path, "not json").unwrap();
+        assert_eq!(previous_whitelist_slot(path), None);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
