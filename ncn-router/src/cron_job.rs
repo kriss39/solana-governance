@@ -352,17 +352,11 @@ fn compare_with_chain(
         whitelist_verifiers.push(verifier);
     }
 
-    // Build and write whitelist snapshot for this network.
-    let snapshot_slot = if chosen_slot != 0 {
-        chosen_slot
-    } else {
-        // Fallback to max slot seen in log entries (even if none were fully ok).
-        entries
-            .iter()
-            .map(|e| e.slot)
-            .max()
-            .unwrap_or_default()
-    };
+    // Build and write whitelist snapshot for this network. Once a finalized
+    // reference is known, keep writing that slot even if a whole run has no
+    // routable verifiers (all pending/error). Otherwise the next run would only
+    // rediscover the fleet's newer pending slot and lose the finalized fallback.
+    let snapshot_slot = persisted_snapshot_slot(chosen_slot, reference_slot, &entries);
 
     // Before de-duplication, so an origin that is stale on one row cannot be
     // preferred as `ok` on another.
@@ -412,9 +406,7 @@ fn whitelist_path_for(network: &str) -> String {
 }
 
 /// The slot the previous run wrote to the whitelist file, if any. It is the
-/// last slot at which some verifier was `ok`, so it is a finalized slot the
-/// fleet served recently — the reference to fall back on once every verifier
-/// has moved its newest snapshot to a pending slot.
+/// finalized reference that should survive fleet-wide pending/error runs.
 fn previous_whitelist_slot(whitelist_path: &str) -> Option<u64> {
     let contents = fs::read_to_string(whitelist_path).ok()?;
     let previous: WhitelistSnapshot = serde_json::from_str(&contents).ok()?;
@@ -433,6 +425,28 @@ fn candidate_slots(entries: &[LogEntry], previous_slot: Option<u64>) -> Vec<u64>
     slots.sort_unstable();
     slots.dedup();
     slots
+}
+
+/// Slot persisted to the whitelist file. Prefer an actually routable verifier,
+/// but if a run has no `ok` entries keep the newest finalized reference instead
+/// of overwriting it with a pending/error slot. Only the very first run, before
+/// any finalized reference exists, falls back to the freshest reported slot.
+fn persisted_snapshot_slot(
+    chosen_slot: u64,
+    reference_slot: Option<u64>,
+    entries: &[LogEntry],
+) -> u64 {
+    if chosen_slot != 0 {
+        chosen_slot
+    } else if let Some(reference_slot) = reference_slot {
+        reference_slot
+    } else {
+        entries
+            .iter()
+            .map(|e| e.slot)
+            .max()
+            .unwrap_or_default()
+    }
 }
 
 fn max_verifier_slot_lag() -> u64 {
@@ -1351,13 +1365,76 @@ mod pending_consensus {
         fs::write(path, serde_json::to_string_pretty(&written).unwrap()).unwrap();
         assert_eq!(previous_whitelist_slot(path), Some(S1));
 
-        // A run that found no ok verifier writes slot 0; that is not a reference.
+        // A legacy/invalid run with slot 0 still has no usable reference.
         fs::write(path, r#"{"network":"mainnet","slot":0,"updated_at":"","verifiers":[]}"#).unwrap();
         assert_eq!(previous_whitelist_slot(path), None);
 
         fs::write(path, "not json").unwrap();
         assert_eq!(previous_whitelist_slot(path), None);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn finalized_reference_survives_consecutive_all_pending_runs() {
+        let entries: Vec<LogEntry> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| entry(n, S2, S2_ROOT, S2_HASH))
+            .collect();
+
+        let dir = std::env::temp_dir().join(format!(
+            "ncn-router-reference-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ncn_whitelist.mainnet.json");
+        let path = path.to_str().unwrap();
+
+        let mut previous = Some(S1);
+        for _ in 0..2 {
+            let persisted = persisted_snapshot_slot(0, previous, &entries);
+            assert_eq!(persisted, S1);
+            let written = WhitelistSnapshot {
+                network: "mainnet".to_string(),
+                slot: persisted,
+                updated_at: "2026-09-16T00:00:00Z".to_string(),
+                verifiers: Vec::new(),
+            };
+            fs::write(path, serde_json::to_string_pretty(&written).unwrap()).unwrap();
+            previous = previous_whitelist_slot(path);
+            assert_eq!(previous, Some(S1));
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn finalized_reference_survives_all_error_run_and_advances_when_new_slot_finalizes() {
+        let mut errors: Vec<LogEntry> = ["a", "b"]
+            .iter()
+            .map(|n| entry(n, 0, "", ""))
+            .collect();
+        for entry in &mut errors {
+            entry.error = Some("unreachable".to_string());
+        }
+        assert_eq!(persisted_snapshot_slot(0, Some(S1), &errors), S1);
+
+        // Once S2 is finalized and an ok verifier is selected there, normal
+        // chosen-slot precedence advances the persisted reference to S2.
+        let s2_entries = vec![entry("a", S2, S2_ROOT, S2_HASH)];
+        assert_eq!(persisted_snapshot_slot(S2, Some(S2), &s2_entries), S2);
+    }
+
+    #[test]
+    fn first_pending_run_without_any_finalized_reference_uses_freshest_reported_slot() {
+        let entries = vec![
+            entry("a", S1, S1_ROOT, S1_HASH),
+            entry("b", S2, S2_ROOT, S2_HASH),
+        ];
+        assert_eq!(persisted_snapshot_slot(0, None, &entries), S2);
     }
 
     #[test]
