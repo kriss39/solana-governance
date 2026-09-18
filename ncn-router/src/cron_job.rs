@@ -252,9 +252,7 @@ fn compare_with_chain(
     });
     let program_id = Pubkey::from_str(&program_id_str)?;
     let client = RpcClient::new(rpc_url);
-    let http = Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()?;
+    let http = Client::builder().timeout(Duration::from_secs(15)).build()?;
 
     println!("network | name | meta_merkle_root | snapshot_hash | (domain)");
 
@@ -462,11 +460,7 @@ fn persisted_snapshot_slot(
     match reference_slot {
         Some(reference_slot) => chosen_slot.max(reference_slot),
         None if chosen_slot != 0 => chosen_slot,
-        None => entries
-            .iter()
-            .map(|e| e.slot)
-            .max()
-            .unwrap_or_default(),
+        None => entries.iter().map(|e| e.slot).max().unwrap_or_default(),
     }
 }
 
@@ -670,6 +664,17 @@ fn judge_pending_entry(
             ))
         }
     };
+    // Same rule as `log_entry_from_meta`: trust the network we asked for, not
+    // the one the answer claims, and say so when the two disagree. The row
+    // below takes its network from `entry` either way. A snapshot from another
+    // network cannot match this network's ballot, so a mislabelled answer can
+    // only cost the verifier an `ok`, never earn it one.
+    if meta.network != network {
+        eprintln!(
+            "[ncn-meta-cron] verifier '{}' ({}) reported network '{}' for requested network '{}' at slot {}; judging it as '{}'",
+            entry.name, entry.domain, meta.network, network, reference_slot, network
+        );
+    }
     if meta.slot != reference_slot {
         return pending(format!(
             "slot {} has no consensus yet; verifier answered /meta?slot={} with slot {}",
@@ -1251,7 +1256,7 @@ mod pending_consensus {
             .map(|e| classify_entry_against_ballot(e, &winning))
             .collect();
         assert!(verifiers.iter().all(|v| v.status == "mismatch"));
-        assert!(verifiers.iter().filter(|v| v.status == "ok").next().is_none());
+        assert!(!verifiers.iter().any(|v| v.status == "ok"));
     }
 
     #[test]
@@ -1392,16 +1397,25 @@ mod pending_consensus {
             network: "mainnet".to_string(),
             slot: S1,
             updated_at: "2026-09-16T00:00:00Z".to_string(),
-            verifiers: vec![entry("a", S1, S1_ROOT, S1_HASH)]
+            verifiers: [entry("a", S1, S1_ROOT, S1_HASH)]
                 .iter()
-                .map(|e| classify_entry_against_ballot(e, &states()[&S1].as_ref().unwrap().winning_ballot))
+                .map(|e| {
+                    classify_entry_against_ballot(
+                        e,
+                        &states()[&S1].as_ref().unwrap().winning_ballot,
+                    )
+                })
                 .collect(),
         };
         fs::write(path, serde_json::to_string_pretty(&written).unwrap()).unwrap();
         assert_eq!(previous_whitelist_slot(path), Some(S1));
 
         // Slot 0 means an older or half-written file, which is no reference.
-        fs::write(path, r#"{"network":"mainnet","slot":0,"updated_at":"","verifiers":[]}"#).unwrap();
+        fs::write(
+            path,
+            r#"{"network":"mainnet","slot":0,"updated_at":"","verifiers":[]}"#,
+        )
+        .unwrap();
         assert_eq!(previous_whitelist_slot(path), None);
 
         fs::write(path, "not json").unwrap();
@@ -1448,10 +1462,7 @@ mod pending_consensus {
 
     #[test]
     fn finalized_reference_survives_all_error_run_and_advances_when_new_slot_finalizes() {
-        let mut errors: Vec<LogEntry> = ["a", "b"]
-            .iter()
-            .map(|n| entry(n, 0, "", ""))
-            .collect();
+        let mut errors: Vec<LogEntry> = ["a", "b"].iter().map(|n| entry(n, 0, "", "")).collect();
         for entry in &mut errors {
             entry.error = Some("unreachable".to_string());
         }
