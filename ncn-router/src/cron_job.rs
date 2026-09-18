@@ -438,27 +438,35 @@ fn candidate_slots(entries: &[LogEntry], previous_slot: Option<u64>) -> Vec<u64>
 
 /// Slot to record in the whitelist file.
 ///
-/// Normally that is `chosen_slot`, the newest slot with a routable verifier on
-/// it. When a run turns up no routable verifier at all, record `reference_slot`
-/// instead: writing the newer, unvoted slot would erase the only record of the
-/// last voted-through one, and the next run would have nothing to fall back
-/// on. Only a first run, with no voted-through slot anywhere, falls back to
-/// the newest slot reported.
+/// This field is what the next run reads back as its reference, via
+/// `previous_whitelist_slot`, so it must never move backwards: whatever this
+/// run writes is the oldest slot a later run can fall back to.
+///
+/// That makes it the newer of `chosen_slot` (the newest slot with a routable
+/// verifier on it) and `reference_slot` (the newest slot voted through). They
+/// are usually the same, but either one can be ahead:
+///
+/// - no routable verifier at all leaves `chosen_slot` at 0, so the reference
+///   is written and survives the run;
+/// - a lagging operator can be the only routable verifier while everyone else
+///   sits on a slot that is still unvoted. Its slot is older than the
+///   reference, and writing it would drop the newest voted-through slot.
+///
+/// Only a first run, with no voted-through slot anywhere, has neither and
+/// falls back to the newest slot reported.
 fn persisted_snapshot_slot(
     chosen_slot: u64,
     reference_slot: Option<u64>,
     entries: &[LogEntry],
 ) -> u64 {
-    if chosen_slot != 0 {
-        chosen_slot
-    } else if let Some(reference_slot) = reference_slot {
-        reference_slot
-    } else {
-        entries
+    match reference_slot {
+        Some(reference_slot) => chosen_slot.max(reference_slot),
+        None if chosen_slot != 0 => chosen_slot,
+        None => entries
             .iter()
             .map(|e| e.slot)
             .max()
-            .unwrap_or_default()
+            .unwrap_or_default(),
     }
 }
 
@@ -1453,6 +1461,25 @@ mod pending_consensus {
         // `chosen_slot` takes precedence again and the file moves to S2.
         let s2_entries = vec![entry("a", S2, S2_ROOT, S2_HASH)];
         assert_eq!(persisted_snapshot_slot(S2, Some(S2), &s2_entries), S2);
+    }
+
+    #[test]
+    fn an_ok_verifier_on_an_older_slot_does_not_drag_the_reference_backwards() {
+        // One operator lags behind on S0 while the rest of the fleet has moved
+        // to the still-unvoted S2 and pruned S1, so the only routable verifier
+        // sits on a slot older than the reference. Recording S0 would throw
+        // away S1, which is the newest slot anything can still be judged
+        // against, and the next run would fall back to S0 instead.
+        const S0: u64 = 440_209_000;
+        let entries = vec![
+            entry("lagging", S0, S1_ROOT, S1_HASH),
+            entry("a", S2, S2_ROOT, S2_HASH),
+        ];
+        assert_eq!(persisted_snapshot_slot(S0, Some(S1), &entries), S1);
+
+        // A routable verifier ahead of the reference still wins, so the file
+        // keeps advancing once a newer slot is voted through.
+        assert_eq!(persisted_snapshot_slot(S2, Some(S1), &entries), S2);
     }
 
     #[test]
