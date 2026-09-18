@@ -36,7 +36,27 @@
   - `NCN_PROGRAM_ID` (required): NCN program ID on Solana
   - `NCN_WHITELIST_MAINNET_PATH` / `NCN_WHITELIST_TESTNET_PATH` (optional): Output paths for whitelist JSON (defaults to `ncn_whitelist.mainnet.json` / `ncn_whitelist.testnet.json`)
   - `NCN_MAX_VERIFIER_SLOT_LAG` (optional): How many slots a verifier's snapshot may trail the freshest whitelisted verifier before it is marked `stale` and dropped from routing (default: `432000`, one epoch / ~2 days). A verifier that stopped uploading still matches the on-chain ballot for its own old slot, so it stays `ok` without this bound and 404s every current proof request.
-- **Statuses** written to the whitelist file: `ok` (routable), `mismatch` (root or hash disagrees with the on-chain ballot), `stale` (see above), `error` (verifier or RPC unreachable) and `pending`. A verifier is `pending` when its newest snapshot is for a ballot box that has not reached consensus yet — operators upload before they vote, so this is normal for a few hours — and it could not be judged on the newest finalized snapshot instead: it no longer serves that slot, or it runs a verifier service older than 0.6 that ignores `/meta?slot=`. Verifiers that still serve the finalized snapshot stay `ok` (with a reason noting the pending upload) so routing keeps working for proposals voting against it. The finalized slot is taken from the fleet's reports or, once every verifier has moved on to the pending slot, from the `slot` the previous run wrote to the whitelist file — so keep that file between runs.
+- **Statuses** written to the whitelist file:
+  - `ok`: routable.
+  - `mismatch`: the root or the hash disagrees with the ballot the chain agreed on.
+  - `stale`: too far behind the freshest verifier, see above.
+  - `error`: the verifier or the RPC could not be reached.
+  - `pending`: not routable, explained below.
+
+  A verifier goes `pending` when its newest snapshot sits in a ballot box that
+  operators have not voted through yet. That is normal for a few hours, because
+  operators upload a snapshot before they vote on it. When that happens the
+  cron asks the verifier for the newest snapshot that *was* voted through and
+  checks it against that one instead, so a verifier that still serves it stays
+  `ok` and routing keeps working for the proposal being voted on. The status is
+  `pending` only when that check is not possible: the verifier has pruned the
+  older snapshot, or it runs a verifier service older than 0.6, which ignores
+  `/meta?slot=` and always answers with its newest snapshot.
+
+  The voted-through slot normally comes from the verifiers' own reports. Once
+  every verifier has moved on to the newer, unvoted slot, it comes from the
+  `slot` field the previous run wrote to the whitelist file instead, so keep
+  that file between runs.
 
 ### Usage
 

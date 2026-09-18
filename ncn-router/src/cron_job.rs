@@ -258,15 +258,19 @@ fn compare_with_chain(
 
     println!("network | name | meta_merkle_root | snapshot_hash | (domain)");
 
-    // Pass 1: read the ballot box for every distinct slot the fleet reports,
-    // plus the slot the previous run whitelisted. A slot whose box has not
-    // reached consensus is "pending": the operators uploaded their snapshots
-    // (the documented order is upload, then vote) but the chain has no
-    // canonical root yet, so such an entry can neither match nor mismatch.
-    // Judging it against the zero `winning_ballot` would demote every
-    // up-to-date verifier at once and leave nothing to route to. The previous
-    // whitelist slot keeps a finalized reference available even once the whole
-    // fleet reports the pending slot and nobody names the finalized one.
+    // Read, once each, every ballot box this run might need: one per slot a
+    // verifier reported, plus the slot the previous run recorded. See
+    // `candidate_slots`.
+    //
+    // A ballot box has no winning ballot until operators vote it past its
+    // consensus threshold, and operators upload their snapshot before they
+    // vote. So for the few hours between the first upload for a slot and the
+    // vote that settles it, the box exists but `winning_ballot` is still
+    // all-zero. Checking a verifier against those zeros marks it `mismatch`,
+    // and because operators upload at roughly the same time it marks the
+    // whole fleet `mismatch` together, leaving the router with nobody to
+    // route to. `slot_consensus_reached` is what tells "not voted yet" apart
+    // from "voted, and this verifier disagrees", so read it with the ballot.
     let whitelist_path = whitelist_path_for(network);
     let mut states: std::collections::HashMap<u64, Result<BallotBoxState, String>> =
         std::collections::HashMap::new();
@@ -276,8 +280,9 @@ fn compare_with_chain(
             .or_insert_with(|| fetch_ballot_box_state_cron(&client, &program_id, slot));
     }
 
-    // The newest slot with a finalized ballot. Verifiers that already moved on
-    // to a pending slot are judged by what they still serve for this one.
+    // Newest slot that has actually been voted through. A verifier sitting on
+    // a newer, not-yet-voted snapshot is checked against this slot instead;
+    // see `judge_pending_entry`.
     let reference_slot = states
         .iter()
         .filter_map(|(slot, state)| match state {
@@ -352,10 +357,9 @@ fn compare_with_chain(
         whitelist_verifiers.push(verifier);
     }
 
-    // Build and write whitelist snapshot for this network. Once a finalized
-    // reference is known, keep writing that slot even if a whole run has no
-    // routable verifiers (all pending/error). Otherwise the next run would only
-    // rediscover the fleet's newer pending slot and lose the finalized fallback.
+    // Build and write the whitelist snapshot for this network. See
+    // `persisted_snapshot_slot` for why a run that found no routable verifier
+    // keeps the previous slot instead of writing the newest one it saw.
     let snapshot_slot = persisted_snapshot_slot(chosen_slot, reference_slot, &entries);
 
     // Before de-duplication, so an origin that is stale on one row cannot be
@@ -405,16 +409,21 @@ fn whitelist_path_for(network: &str) -> String {
     }
 }
 
-/// The slot the previous run wrote to the whitelist file, if any. It is the
-/// finalized reference that should survive fleet-wide pending/error runs.
+/// Slot the previous run wrote to the whitelist file, if that file exists and
+/// names a real slot.
+///
+/// Once every verifier has moved on to a slot that is still waiting on a vote,
+/// nothing in this run's own data points at a voted-through slot any more. The
+/// file is then the only remaining record of the last one.
 fn previous_whitelist_slot(whitelist_path: &str) -> Option<u64> {
     let contents = fs::read_to_string(whitelist_path).ok()?;
     let previous: WhitelistSnapshot = serde_json::from_str(&contents).ok()?;
     (previous.slot != 0).then_some(previous.slot)
 }
 
-/// Distinct slots whose ballot boxes pass 1 reads: every slot a verifier
-/// reported plus the previous whitelist slot.
+/// Slots whose ballot boxes this run needs to read: every slot a verifier
+/// reported, plus `previous_slot` when there is one. Sorted and de-duplicated,
+/// so a slot that half the fleet reports is still only fetched once.
 fn candidate_slots(entries: &[LogEntry], previous_slot: Option<u64>) -> Vec<u64> {
     let mut slots: Vec<u64> = entries
         .iter()
@@ -427,10 +436,14 @@ fn candidate_slots(entries: &[LogEntry], previous_slot: Option<u64>) -> Vec<u64>
     slots
 }
 
-/// Slot persisted to the whitelist file. Prefer an actually routable verifier,
-/// but if a run has no `ok` entries keep the newest finalized reference instead
-/// of overwriting it with a pending/error slot. Only the very first run, before
-/// any finalized reference exists, falls back to the freshest reported slot.
+/// Slot to record in the whitelist file.
+///
+/// Normally that is `chosen_slot`, the newest slot with a routable verifier on
+/// it. When a run turns up no routable verifier at all, record `reference_slot`
+/// instead: writing the newer, unvoted slot would erase the only record of the
+/// last voted-through one, and the next run would have nothing to fall back
+/// on. Only a first run, with no voted-through slot anywhere, falls back to
+/// the newest slot reported.
 fn persisted_snapshot_slot(
     chosen_slot: u64,
     reference_slot: Option<u64>,
@@ -589,17 +602,23 @@ fn fetch_ballot_box_state_cron(
     }
 }
 
-/// Status for a verifier whose newest snapshot (`entry.slot`) has no on-chain
-/// consensus yet.
+/// Classify a verifier whose newest snapshot, at `entry.slot`, sits in a
+/// ballot box that has not been voted through yet.
 ///
-/// The verifier is asked for `reference_slot` — the newest slot that *does*
-/// have consensus — and judged on that. A verifier still serving the canonical
-/// snapshot stays routable while the fleet votes on the next one; one that
-/// has already pruned it, or that ignores the `slot` parameter (verifier
-/// service < 0.6 answers `/meta?slot=` with its newest snapshot), is reported
-/// as `pending` rather than `ok`. With no reference slot at all — the very
-/// first snapshot — there is nothing to judge against, so the entry is
-/// `pending` too.
+/// Nothing on chain says whether that snapshot is correct, so ask the verifier
+/// for `reference_slot` (the newest slot that was voted through) and check its
+/// answer against that ballot instead. A verifier that still serves the agreed
+/// snapshot can still answer proof requests for the proposal being voted on,
+/// so it stays `ok`.
+///
+/// The result is `pending`, which is not routable, whenever there is nothing
+/// to check against:
+/// - no slot has been voted through yet, as on a brand new deployment;
+/// - the reference ballot box could not be read;
+/// - the verifier no longer serves that slot, usually a 404 after pruning;
+/// - the verifier answered with a different slot, which means verifier-service
+///   older than 0.6: it ignores `slot` on `/meta` and returns its newest
+///   snapshot regardless.
 fn judge_pending_entry(
     fetch_meta_at: impl Fn(&str) -> Result<MetaResponse, String>,
     entry: &LogEntry,
@@ -671,8 +690,9 @@ fn parse_winning_ballot(data: &[u8]) -> Result<Ballot, String> {
     parse_ballot_box_state(data).map(|state| state.winning_ballot)
 }
 
-/// The two BallotBox fields the cron needs: whether operators have reached
-/// consensus for the slot, and the ballot that won if they have.
+/// The two `BallotBox` fields this cron reads. `slot_consensus_reached` stays
+/// 0, and `winning_ballot` stays all-zero, until operators vote the box past
+/// its threshold.
 #[derive(Debug)]
 struct BallotBoxState {
     slot_consensus_reached: u64,
@@ -700,9 +720,9 @@ fn parse_ballot_box_state(mut data: &[u8]) -> Result<BallotBoxState, String> {
     })
 }
 
-/// Status the cron assigns to a verifier whose newest snapshot is `entry`,
-/// given the on-chain ballot box for `entry.slot`. Mirrors the inline logic in
-/// `compare_with_chain`.
+/// Compare what a verifier reported in `entry` against the ballot the chain
+/// agreed on: `ok` when both the meta merkle root and the snapshot hash match,
+/// `mismatch` otherwise, with `reason` recording which of the two failed.
 fn classify_entry_against_ballot(entry: &LogEntry, ballot: &Ballot) -> WhitelistVerifier {
     let onchain_merkle_root = bytes32_base58(&ballot.meta_merkle_root);
     let onchain_snapshot_hash = bytes32_base58(&ballot.snapshot_hash);
@@ -809,7 +829,7 @@ fn log_entry_from_meta(
     }
 }
 
-/// GET `url` and decode the verifier's `/meta` body.
+/// Fetch and decode one verifier's `/meta` response.
 fn fetch_meta_response(client: &Client, url: &str) -> Result<MetaResponse, String> {
     let resp = client.get(url).send().map_err(|e| format!("failed: {e}"))?;
     if !resp.status().is_success() {
@@ -1122,18 +1142,23 @@ mod tests {
 
 #[cfg(test)]
 mod pending_consensus {
-    //! A verifier whose newest snapshot awaits consensus must be judged by the
-    //! newest finalized snapshot it still serves, not by the zero
-    //! `winning_ballot` of the pending ballot box. `init_ballot_box` leaves
-    //! `winning_ballot` all-zero until `cast_vote` crosses the threshold, and
-    //! operators upload before they vote, so the naive comparison demotes the
-    //! whole fleet together and `select_routable_verifiers` in `router.rs` is
-    //! left with nothing while an older proposal is still being voted on.
+    //! Verifiers whose newest snapshot is still waiting on a vote.
+    //!
+    //! `init_ballot_box` leaves `winning_ballot` all-zero until `cast_vote`
+    //! carries the box past its threshold, and operators upload their snapshot
+    //! before they vote. Checking a verifier against those zeros therefore
+    //! marks every operator that uploaded on time as `mismatch` at the same
+    //! moment, and `select_routable_verifiers` in `router.rs` is left with
+    //! nobody to route to while the previous proposal is still being voted on.
+    //!
+    //! These tests pin down the behaviour that avoids that: such a verifier is
+    //! checked against the newest snapshot that was voted through and that it
+    //! still serves.
     use super::*;
     use std::collections::HashMap;
 
-    const S1: u64 = 440_641_000; // finalized on mainnet
-    const S2: u64 = 441_073_000; // pending
+    const S1: u64 = 440_641_000; // voted through on mainnet
+    const S2: u64 = 441_073_000; // uploaded, not voted on yet
     const S1_ROOT: &str = "2Jwjfi6KWQmqMraTkCcWqdj3VvyGcVgfNGYdzTQmaUj8";
     const S1_HASH: &str = "7TgfsjkYnyJ6DWKG8CTc7Yt9426fKRqs5Fh2xvunvXZ2";
     const S2_ROOT: &str = "3MpDoa4y8sNvuLd2ba9YJGzDeUnmA8b7fdrWYqW7QKf6";
@@ -1144,9 +1169,10 @@ mod pending_consensus {
         bytes.as_slice().try_into().unwrap()
     }
 
-    /// Bytes of a `BallotBox` exactly as `init_ballot_box` leaves them: the
-    /// handler writes bump/epoch/slot_created/threshold/expiry/snapshot_slot
-    /// and nothing else, so `winning_ballot` is `Ballot::default()`.
+    /// Bytes of a `BallotBox` exactly as `init_ballot_box` leaves it. The
+    /// handler sets bump, epoch, slot_created, threshold, expiry and
+    /// snapshot_slot, and nothing else, so `winning_ballot` is still
+    /// `Ballot::default()`.
     fn freshly_initialized_ballot_box(snapshot_slot: u64) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend_from_slice(&BALLOT_BOX_DISCRIMINATOR);
@@ -1209,7 +1235,7 @@ mod pending_consensus {
 
     #[test]
     fn the_naive_comparison_demotes_every_up_to_date_verifier() {
-        // The pre-fix behaviour, kept as documentation of why the fallback exists.
+        // How the old code behaved, kept to show what the fallback prevents.
         let winning = parse_winning_ballot(&freshly_initialized_ballot_box(S2)[8..]).unwrap();
         let verifiers: Vec<WhitelistVerifier> = ["a", "b", "c", "d"]
             .map(|n| entry(n, S2, S2_ROOT, S2_HASH))
@@ -1235,7 +1261,8 @@ mod pending_consensus {
             &states(),
         );
         assert_eq!(v.status, "ok", "{v:?}");
-        // Judged (and later staleness-checked) at the reference slot.
+        // Recorded at the reference slot, so the staleness check later in the
+        // run measures it there too.
         assert_eq!(v.slot, S1);
         assert!(v.reason.unwrap().contains("awaits consensus"));
         assert_eq!(
@@ -1303,9 +1330,9 @@ mod pending_consensus {
 
     #[test]
     fn the_previous_whitelist_slot_keeps_a_reference_once_the_whole_fleet_is_pending() {
-        // Every verifier has uploaded S2 and none reports S1 any more. The
-        // fleet's own answers offer no finalized slot; the slot the previous
-        // run whitelisted does.
+        // Every verifier has uploaded S2 and none of them reports S1 any more,
+        // so this run's own data names no voted-through slot. The slot the
+        // previous run wrote to the whitelist file still does.
         let entries: Vec<LogEntry> = ["a", "b", "c", "d"]
             .iter()
             .map(|n| entry(n, S2, S2_ROOT, S2_HASH))
@@ -1365,7 +1392,7 @@ mod pending_consensus {
         fs::write(path, serde_json::to_string_pretty(&written).unwrap()).unwrap();
         assert_eq!(previous_whitelist_slot(path), Some(S1));
 
-        // A legacy/invalid run with slot 0 still has no usable reference.
+        // Slot 0 means an older or half-written file, which is no reference.
         fs::write(path, r#"{"network":"mainnet","slot":0,"updated_at":"","verifiers":[]}"#).unwrap();
         assert_eq!(previous_whitelist_slot(path), None);
 
@@ -1422,8 +1449,8 @@ mod pending_consensus {
         }
         assert_eq!(persisted_snapshot_slot(0, Some(S1), &errors), S1);
 
-        // Once S2 is finalized and an ok verifier is selected there, normal
-        // chosen-slot precedence advances the persisted reference to S2.
+        // Once S2 is voted through and a verifier is routable on it,
+        // `chosen_slot` takes precedence again and the file moves to S2.
         let s2_entries = vec![entry("a", S2, S2_ROOT, S2_HASH)];
         assert_eq!(persisted_snapshot_slot(S2, Some(S2), &s2_entries), S2);
     }
@@ -1439,9 +1466,9 @@ mod pending_consensus {
 
     #[test]
     fn pending_entries_do_not_survive_as_routable_or_move_the_chosen_slot() {
-        // Mirrors the tail of compare_with_chain: pending is neither `ok` nor
-        // does it raise chosen_slot, so demote_stale_verifiers measures the
-        // fleet against the finalized slot.
+        // Same steps as the tail of `compare_with_chain`. A `pending` entry is
+        // not `ok` and does not raise `chosen_slot`, so the freshest slot that
+        // `demote_stale_verifiers` measures against is the voted-through one.
         let ok_on_reference = judge_pending_entry(
             |_| Ok(meta(S1, S1_ROOT, S1_HASH)),
             &entry("a", S2, S2_ROOT, S2_HASH),
